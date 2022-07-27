@@ -12,6 +12,8 @@ import folium
 import contextily as cx
 from OSMPythonTools.overpass import Overpass
 import pickle
+import seaborn as sns
+from matplotlib.colors import TwoSlopeNorm
 
 
 # TIER Zone data
@@ -29,7 +31,7 @@ def get_zones(filename):
 constrained = get_zones('./data/constrained_malmo_tier.json')
 singles = constrained[constrained.zoneConstraints.map(len) == 1]
 
-noParkingSlow = constrained[constrained.zoneConstraints.map(len) == 2]
+noParkingSlow = constrained[constrained.zoneConstraints.map(len) == 2]  
 slowZone = singles[singles.zoneConstraints.map(lambda x: x[0]) == 'speedReduction']
 noParking = singles[singles.zoneConstraints.map(lambda x: x[0]) == 'noParking']
 parking = get_zones('./data/parking_malmo_tier.json')
@@ -85,13 +87,57 @@ for row in population_json['data']:
     df_dict[deso_id][category] = int(row['values'][0])
 
 population_deso = pd.DataFrame.from_dict(df_dict, orient='index')
-population_deso.index.name = 'deso'
+population_deso.index.name = 'deso2'
+population_deso['deso'] = population_deso.apply(lambda x: x.name, 1)
+
+young_ages = ['-4', '5-9', '10-14', '15-19', '20-24']
+population_deso['under_25'] = population_deso[young_ages].sum(axis=1)
+population_deso['under_25_norm'] = population_deso['under_25']/population_deso['totalt']
 
 # Population covered by TIER
 cov = sum(population_deso.merge(tier_deso, on='deso').totalt)
 not_cov = sum(population_deso.merge(non_tier_deso, on='deso').totalt)
 malmo_population = cov+not_cov
 cov/malmo_population
+
+# Registered cars DeSO
+# -------------------------------------------------------
+f = open('./data/cars_deso.json')
+cars = json.load(f)
+
+cars = pd.DataFrame(cars['data'])
+cars['deso'] = cars.apply(lambda x: x['key'][0], 1)
+cars['total'] = cars.apply(lambda x: int(x['values'][0]), 1)
+cars = cars[['deso', 'total']]
+
+cars_malmo = cars[cars.deso.isin(malmo.deso)]
+cars_malmo = gpd.GeoDataFrame(pd.merge(cars_malmo, malmo[['deso', 'geometry']], on='deso'), geometry='geometry')
+cars_malmo = gpd.GeoDataFrame(pd.merge(cars_malmo, population_deso[['deso', 'totalt', 'under_25_norm']], on='deso'), geometry='geometry')
+cars_malmo['cars_per_100'] = (cars_malmo['total']/cars_malmo['totalt'])*100
+cars_malmo.iloc[0]
+
+
+cars[cars.deso == '0114A0010']
+
+cars_min, cars_max = cars_malmo['cars_per_100'].min(), cars_malmo['cars_per_100'].max()
+cars_malmo['total_norm'] = (cars_malmo['cars_per_100']-cars_min)/cars_max
+
+norm = TwoSlopeNorm(vmin=cars_min, vcenter=27.0, vmax=cars_max)
+cmap = 'RdBu'
+cbar = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+# Plot
+fig, ax = plt.subplots(figsize=(10, 10))
+root_zone.to_crs(epsg=3857).plot(ax=ax, facecolor='none', edgecolor='teal', linewidth=2, label="Missing values")
+cars_malmo.to_crs(epsg=3857).plot(ax=ax, alpha=0.7, linewidth=0.3, edgecolor='black', column='under_25_norm', cmap=cmap, legend=True)
+root_zone.to_crs(epsg=3857).plot(ax=ax, facecolor='none', edgecolor='black', linewidth=3, label="Missing values", alpha=0.7)
+cx.add_basemap(ax, zoom=12, source=cx.providers.CartoDB.Positron)
+minx, miny, maxx, maxy = root_zone.to_crs(epsg=3857).total_bounds
+ax.set_xlim(minx, maxx)
+ax.set_ylim(miny, maxy)
+ax.set_axis_off()
+ax.legend()
+plt.show()
 
 # Plotting using basemaps
 # -------------------------------------------------------
@@ -104,20 +150,6 @@ ax.set_axis_off()
 ax.legend(['First line', 'Second line'])
 plt.show()
 
-# Plotting restricted zones
-# -------------------------------------------------------
-fig, ax = plt.subplots(figsize=(15, 15))
-# alpha = 0.15
-root_zone.to_crs(epsg=3857).plot(ax=ax, facecolor='none', edgecolor='teal', linewidth=2, label="Missing values")
-# noParking.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='r', edgecolor='tomato', linewidth=0)
-# slowZone.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='gold', edgecolor='gold', linewidth=0)
-# noParkingSlow.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='gold', edgecolor='r', linewidth=0, hatch="//////")
-parking_centroids.to_crs(epsg=3857).plot(ax=ax, color='dodgerblue', edgecolor='steelblue', marker='o', markersize=150)
-bike_rentals.to_crs(epsg=3857).plot(ax=ax, color='orange', edgecolor='darkorange', marker='X', markersize=150)
-cx.add_basemap(ax, zoom=12, source=cx.providers.CartoDB.Positron)
-ax.set_axis_off()
-plt.show()
-
 # Get MalmöByBike docking stations
 # -------------------------------------------------------
 # overpass = Overpass()
@@ -126,20 +158,38 @@ bike_rentals = gpd.read_file('./data/bike_rentals_greater_cph.geojson', crs='eps
 bike_rentals = bike_rentals[['description','name', 'network','geometry']]
 bike_rentals = bike_rentals[bike_rentals.network == 'Malmö by bike']
 
-# Parking spot analysis
+# convex-hull parking perimiter
 # -------------------------------------------------------
+cvp = parking_centroids.unary_union.convex_hull
+parking_buffer = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[cvp])
 
-parking_centroids
-closed_noparking = constrained.apply(lambda x: x.geometry.convex_hull, 1)
 
-overlapping_parking = []
-for pol in closed_noparking:
-    for idx, parking in parking_centroids.iterrows():
-        if pol.contains(parking.geometry):
-            overlapping_parking.append(parking['name'])
+# Plotting restricted zones
+# -------------------------------------------------------
+root_buffer = gpd.GeoDataFrame(root_zone.buffer(-0.0019, resolution=150), geometry=0)
+root_edge = root_zone.overlay(root_buffer, how='symmetric_difference')
 
-blocked_names = ['scooterzon Posthusplatsen', 'Malmostad Parking Zone Central Station', 'Triangeln E', 'Södra Triangeln', 'Parkering Stadion', 'Parkering Stadionområdet', 'Varnhem parking', 'E5 Värnhemstorget Resecentrum']
 
-no_parking_parking = parking_centroids[parking_centroids['name'].isin(blocked_names)]
-parking_centroids['encapsulated'] = parking_centroids['name'].isin(blocked_names)
+# Transit hubs
+# -------------------------------------------------------
+transit_hubs = [(55.6091534, 13.000106), (55.6091966, 13.004069740), (55.60903328, 12.996944352), (55.59201697, 13.00177384), (55.5944530, 13.0004943), (55.563181, 12.9768425), (55.5804429, 13.0292447), (55.589560, 13.031194), (55.6076402, 13.0324545), (55.58877913, 13.00637692), (55.6056939, 13.02362259)]
+transit_hubs = [Point(lon, lat) for lat, lon in transit_hubs]
+transit_hubs = gpd.GeoDataFrame(transit_hubs, crs='epsg:4326', columns=['geometry'])
+
+# flexible plotting
+# -------------------------------------------------------
+fig, ax = plt.subplots(figsize=(10, 10))
+root_zone.to_crs(epsg=3857).plot(ax=ax, facecolor='none', edgecolor='teal', linewidth=2, label="Missing values", alpha=0.7)
+root_zone.overlay(tier_deso, how='intersection').to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='none', edgecolor='r', linewidth=1, hatch="///")
+root_edge.to_crs(epsg=3857).plot(ax=ax, facecolor='red', alpha=0.5)
+transit_hubs.to_crs(epsg=3857).plot(ax=ax, color='orange', edgecolor='darkorange', marker='X', markersize=150)
+noParking.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='r', edgecolor='tomato', linewidth=0)
+slowZone.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='gold', edgecolor='gold', linewidth=0)
+noParkingSlow.to_crs(epsg=3857).plot(ax=ax, alpha=alpha, facecolor='gold', edgecolor='r', linewidth=0, hatch="//////")
+parking_centroids.to_crs(epsg=3857).plot(ax=ax, color='dodgerblue', edgecolor='steelblue', marker='o', markersize=150)
+parking_buffer.buffer(0.004).to_crs(epsg=3857).plot(ax=ax, facecolor='none', edgecolor='dodgerblue', linewidth=2, ls="--")
+bike_rentals.to_crs(epsg=3857).plot(ax=ax, color='orange', edgecolor='darkorange', marker='X', markersize=150)
+cx.add_basemap(ax, zoom=12, source=cx.providers.CartoDB.Positron)
+ax.set_axis_off()
+plt.show()
 
